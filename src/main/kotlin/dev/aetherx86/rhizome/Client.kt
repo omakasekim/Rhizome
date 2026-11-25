@@ -1,4 +1,4 @@
-package dev.aetherx86.rhizome
+package dev.omakasekim.rhizome
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred

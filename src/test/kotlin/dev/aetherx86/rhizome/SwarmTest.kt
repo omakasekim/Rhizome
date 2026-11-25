@@ -1,4 +1,4 @@
-package dev.aetherx86.rhizome
+package dev.omakasekim.rhizome
 
 import com.sun.net.httpserver.HttpServer
 import kotlinx.coroutines.CoroutineScope

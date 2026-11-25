@@ -1,4 +1,4 @@
-package dev.aetherx86.rhizome
+package dev.omakasekim.rhizome
 
 /**
  * A small JSON writer for the command line's `--json` output, so that the library needs no

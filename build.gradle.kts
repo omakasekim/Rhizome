@@ -6,7 +6,7 @@ plugins {
     `maven-publish`
 }
 
-group = "dev.aetherx86.rhizome"
+group = "dev.omakasekim.rhizome"
 version = "0.2.0"
 
 repositories { mavenCentral() }
@@ -28,7 +28,7 @@ dependencies {
 }
 
 application {
-    mainClass.set("dev.aetherx86.rhizome.MainKt")
+    mainClass.set("dev.omakasekim.rhizome.MainKt")
     applicationName = "rhizome"
 }
 
@@ -47,7 +47,7 @@ publishing {
     repositories {
         maven {
             name = "GitHubPackages"
-            url = uri("https://maven.pkg.github.com/Aetherx86/Rhizome")
+            url = uri("https://maven.pkg.github.com/omakasekim/Rhizome")
             credentials {
                 username = System.getenv("GITHUB_ACTOR")
                 password = System.getenv("GITHUB_TOKEN")

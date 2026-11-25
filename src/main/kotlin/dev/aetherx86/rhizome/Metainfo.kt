@@ -1,4 +1,4 @@
-package dev.aetherx86.rhizome
+package dev.omakasekim.rhizome
 
 import java.net.URLDecoder
 import java.security.MessageDigest

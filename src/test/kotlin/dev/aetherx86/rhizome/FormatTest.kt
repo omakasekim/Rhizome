@@ -1,4 +1,4 @@
-package dev.aetherx86.rhizome
+package dev.omakasekim.rhizome
 
 import java.io.ByteArrayInputStream
 import java.io.DataInputStream

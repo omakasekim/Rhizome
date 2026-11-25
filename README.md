@@ -110,7 +110,7 @@ which verifies the existing files and then seeds them. Errors with `--json` come
 
 ## Usage as a library
 
-Published to GitHub Packages as `dev.aetherx86.rhizome:rhizome`.
+Published to GitHub Packages as `dev.omakasekim.rhizome:rhizome`.
 
 ```kotlin
 val client = RhizomeClient()
