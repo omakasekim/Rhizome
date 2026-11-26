@@ -1,6 +1,7 @@
 package dev.omakasekim.rhizome
 
 import java.net.URLDecoder
+import java.net.URLEncoder
 import java.security.MessageDigest
 
 class InvalidTorrent(message: String) : Exception(message)
@@ -65,6 +66,14 @@ class Metainfo private constructor(
         infoHash, name, pieceLength, pieceHashes, files, totalLength,
         (trackers + extra).distinct(), isPrivate, rawInfo,
     )
+
+    /** Builds a canonical magnet URI for this torrent (BEP 9). */
+    fun toMagnet(includeTrackers: Boolean = true): String = Magnet(
+        infoHash = infoHash,
+        name = name,
+        trackers = if (includeTrackers) trackers else emptyList(),
+        peers = emptyList(),
+    ).toUri()
 
     companion object {
         /** Refuses absurd piece sizes, which would otherwise mean huge in-memory buffers. */
@@ -230,8 +239,25 @@ class Metainfo private constructor(
 
 /** A parsed magnet link. */
 class Magnet(val infoHash: ByteArray, val name: String?, val trackers: List<String>, val peers: List<String>) {
+    /** Encodes this magnet link back into a canonical RFC-compliant URI string. */
+    fun toUri(): String = buildString {
+        append("magnet:?xt=urn:btih:").append(infoHash.toHex())
+        if (!name.isNullOrEmpty()) {
+            append("&dn=").append(encodeParam(name))
+        }
+        for (tracker in trackers.distinct()) {
+            append("&tr=").append(encodeParam(tracker))
+        }
+        for (peer in peers.distinct()) {
+            append("&x.pe=").append(encodeParam(peer))
+        }
+    }
+
     companion object {
         private const val BASE32 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+
+        private fun encodeParam(value: String): String =
+            URLEncoder.encode(value, Charsets.UTF_8).replace("+", "%20")
 
         private fun decodeBase32(text: String): ByteArray? {
             if (text.length != 32) return null

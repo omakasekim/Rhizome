@@ -3,6 +3,28 @@
 Versions follow this rule: a bug or security fix increments `0.0.X`, and new functionality
 or new platform support increments `0.X.0`.
 
+## [0.3.0] - 2026-11-26
+
+### Added
+
+- Tracker scrape support for HTTP/HTTPS (BEP 48) and UDP (BEP 15, `action = 2`) via
+  `TrackerClient.scrape` and `TrackerClient.scrapeUrl`, enforcing the same SSRF `AddressPolicy`,
+  no-redirect policy, and 1 MiB response cap as announce requests.
+- `rhizome scrape <file.torrent|magnet|hex-hash> [--tracker URL] [--allow-private] [--json]`
+  to query swarm seeder, leecher, and completed counts.
+- Canonical RFC-compliant magnet URI encoding via `Metainfo.toMagnet()` and `Magnet.toUri()`,
+  exposed through `rhizome magnet <file.torrent> [--no-trackers] [--json]` and included in
+  `rhizome info`.
+- Cooperative token-bucket bandwidth rate limiting (`RateLimiter`, `ClientConfig.maxDownloadBytesPerSec`,
+  `ClientConfig.maxUploadBytesPerSec`) wired into peer uploads and downloads and exposed via
+  `rhizome download --max-down N --max-up N`.
+- Korean README (`README.ko.md`).
+
+### Changed
+
+- Peer ID prefix updated to `-RZ0300-`.
+- Enabled `main` push and pull request triggers in CI and Repository Guard workflows.
+
 ## [0.2.0] - 2026-11-20
 
 ### Added

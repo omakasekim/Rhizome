@@ -14,12 +14,14 @@ import java.nio.file.Paths
 import java.util.BitSet
 import kotlin.system.exitProcess
 
-const val RHIZOME_VERSION = "0.2.0"
+const val RHIZOME_VERSION = "0.3.0"
 
 private val USAGE = """
     usage: rhizome <command> [options]
 
       info <file.torrent>             show what a torrent contains
+      magnet <file.torrent>           print the canonical magnet URI for a torrent
+          --no-trackers               omit tracker URLs from the magnet URI
       create <file or folder>         make a torrent from data on disk
           --out FILE                  where to write the torrent (required)
           --piece-length N            piece size in bytes, or with a K or M suffix (default: automatic)
@@ -27,6 +29,9 @@ private val USAGE = """
           --private                   mark the torrent private (BEP 27): no DHT and no peer exchange
       verify <file.torrent>           check the data on disk against the torrent's piece hashes
           --dir DIR                   folder holding the data (default: current folder)
+      scrape <torrent|magnet|hash>    query trackers for seeders, downloads and leechers (BEP 48 / 15)
+          --tracker URL               extra tracker URL to scrape (repeatable)
+          --allow-private             allow trackers on private addresses
       download <file.torrent|magnet>  download, and keep seeding until stopped
           --out DIR                   where to put the files (default: current folder)
           --port N                    port to listen on (default: any free port)
@@ -35,6 +40,8 @@ private val USAGE = """
           --no-dht                    do not use the DHT
           --bootstrap HOST:PORT       DHT node to join through (repeatable)
           --allow-private             allow trackers and peers on private addresses
+          --max-down N                download bandwidth cap in bytes/s (supports K or M suffix)
+          --max-up N                  upload bandwidth cap in bytes/s (supports K or M suffix)
       lookup <hex info hash>          find peers for a torrent on the DHT
           --bootstrap HOST:PORT       DHT node to join through (repeatable)
           --allow-private             allow DHT nodes on private addresses
@@ -52,17 +59,21 @@ private val DEFAULT_BOOTSTRAP = listOf(
 
 private val VALUE_OPTIONS = mapOf(
     "info" to emptySet(),
+    "magnet" to emptySet(),
     "create" to setOf("--out", "--piece-length", "--tracker"),
     "verify" to setOf("--dir"),
-    "download" to setOf("--out", "--port", "--peer", "--bootstrap"),
+    "scrape" to setOf("--tracker"),
+    "download" to setOf("--out", "--port", "--peer", "--bootstrap", "--max-down", "--max-up"),
     "lookup" to setOf("--bootstrap"),
     "version" to emptySet<String>(),
 )
 
 private val FLAG_OPTIONS = mapOf(
     "info" to setOf("--json"),
+    "magnet" to setOf("--json", "--no-trackers"),
     "create" to setOf("--json", "--private"),
     "verify" to setOf("--json"),
+    "scrape" to setOf("--json", "--allow-private"),
     "download" to setOf("--json", "--exit-when-done", "--no-dht", "--allow-private"),
     "lookup" to setOf("--json", "--allow-private"),
     "version" to setOf("--json"),
@@ -159,6 +170,7 @@ class Cli(private val out: PrintStream = System.out, private val err: PrintStrea
                     "piece_length" to meta.pieceLength,
                     "piece_count" to meta.pieceCount,
                     "private" to meta.isPrivate,
+                    "magnet" to meta.toMagnet(),
                     "trackers" to meta.trackers,
                     "files" to meta.files.map { linkedMapOf("path" to it.path, "length" to it.length, "offset" to it.offset) },
                 ),
@@ -169,8 +181,108 @@ class Cli(private val out: PrintStream = System.out, private val err: PrintStrea
         out.println("info hash:    ${meta.infoHash.toHex()}")
         out.println("size:         ${meta.totalLength} bytes in ${meta.pieceCount} pieces of ${meta.pieceLength}")
         out.println("private:      ${meta.isPrivate}")
+        out.println("magnet:       ${meta.toMagnet()}")
         for (url in meta.trackers) out.println("tracker:      $url")
         for (file in meta.files) out.println("file:         ${file.path.joinToString("/")} (${file.length} bytes)")
+    }
+
+    private fun showMagnet(options: Options) {
+        val path = options.positional.singleOrNull() ?: throw IllegalArgumentException("which torrent file?")
+        val meta = Metainfo.parse(File(path).readBytes())
+        val includeTrackers = "--no-trackers" !in options.flags
+        val uri = meta.toMagnet(includeTrackers = includeTrackers)
+        if (options.json) {
+            emit(
+                linkedMapOf(
+                    "name" to meta.name,
+                    "info_hash" to meta.infoHash.toHex(),
+                    "magnet" to uri,
+                ),
+            )
+        } else {
+            out.println(uri)
+        }
+    }
+
+    /** Scrapes trackers for swarm counts. Returns 0 if at least one tracker succeeded, 1 otherwise. */
+    private suspend fun scrape(options: Options): Int {
+        val target = options.positional.singleOrNull() ?: throw IllegalArgumentException("what should be scraped?")
+        val allowPrivate = "--allow-private" in options.flags
+        val extraTrackers = options.values["--tracker"].orEmpty()
+        val hash: ByteArray
+        val trackers: List<String>
+        when {
+            target.startsWith("magnet:") -> {
+                val magnet = Magnet.parse(target)
+                hash = magnet.infoHash
+                trackers = (magnet.trackers + extraTrackers).distinct()
+            }
+            target.length == 40 && hexToBytes(target) != null -> {
+                hash = requireNotNull(hexToBytes(target))
+                trackers = extraTrackers.distinct()
+            }
+            else -> {
+                val meta = Metainfo.parse(File(target).readBytes())
+                hash = meta.infoHash
+                trackers = (meta.trackers + extraTrackers).distinct()
+            }
+        }
+        require(trackers.isNotEmpty()) { "no trackers to scrape (pass --tracker URL)" }
+        val hex = hash.toHex()
+        var succeeded = 0
+        val results = ArrayList<Map<String, Any?>>(trackers.size)
+        for (url in trackers) {
+            try {
+                val stats = TrackerClient.scrape(url, listOf(hash), allowPrivate)[hex]
+                if (stats != null) {
+                    succeeded++
+                    results.add(
+                        linkedMapOf(
+                            "tracker" to url,
+                            "ok" to true,
+                            "complete" to stats.complete,
+                            "downloaded" to stats.downloaded,
+                            "incomplete" to stats.incomplete,
+                        ),
+                    )
+                } else {
+                    results.add(
+                        linkedMapOf(
+                            "tracker" to url,
+                            "ok" to false,
+                            "error" to "info hash not present in tracker response",
+                        ),
+                    )
+                }
+            } catch (e: TrackerError) {
+                results.add(
+                    linkedMapOf(
+                        "tracker" to url,
+                        "ok" to false,
+                        "error" to (e.message ?: "scrape failed"),
+                    ),
+                )
+            }
+        }
+        if (options.json) {
+            emit(
+                linkedMapOf(
+                    "info_hash" to hex,
+                    "trackers" to results,
+                ),
+            )
+        } else {
+            out.println("info hash:    $hex")
+            for (row in results) {
+                val tracker = row["tracker"]
+                if (row["ok"] == true) {
+                    out.println("tracker:      $tracker  seeders=${row["complete"]} leechers=${row["incomplete"]} completed=${row["downloaded"]}")
+                } else {
+                    out.println("tracker:      $tracker  error: ${row["error"]}")
+                }
+            }
+        }
+        return if (succeeded > 0) 0 else 1
     }
 
     private fun create(options: Options) {
@@ -247,8 +359,15 @@ class Cli(private val out: PrintStream = System.out, private val err: PrintStrea
         val port = options.single("--port")?.let { text ->
             text.toIntOrNull()?.takeIf { it in 0..65535 } ?: throw IllegalArgumentException("not a valid port: $text")
         } ?: 0
+        val maxDown = options.single("--max-down")?.let(::parseSize)?.toLong() ?: 0L
+        val maxUp = options.single("--max-up")?.let(::parseSize)?.toLong() ?: 0L
         val dht = if ("--no-dht" in options.flags) null else DhtNode(allowPrivateAddresses = allowPrivate)
-        val config = ClientConfig(port = port, allowPrivateAddresses = allowPrivate)
+        val config = ClientConfig(
+            port = port,
+            allowPrivateAddresses = allowPrivate,
+            maxDownloadBytesPerSec = maxDown,
+            maxUploadBytesPerSec = maxUp,
+        )
         try {
             RhizomeClient(config, dht).use { client ->
                 if (options.json) emit(linkedMapOf("event" to "listening", "port" to client.port))
@@ -354,8 +473,10 @@ class Cli(private val out: PrintStream = System.out, private val err: PrintStrea
             runBlocking {
                 when (command) {
                     "info" -> showInfo(options).let { 0 }
+                    "magnet" -> showMagnet(options).let { 0 }
                     "create" -> create(options).let { 0 }
                     "verify" -> verify(options)
+                    "scrape" -> scrape(options)
                     "download" -> download(options).let { 0 }
                     "lookup" -> lookup(options).let { 0 }
                     else -> {

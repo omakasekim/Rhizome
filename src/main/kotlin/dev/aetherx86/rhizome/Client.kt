@@ -37,7 +37,16 @@ class ClientConfig(
     val chokeRotationMillis: Long = 10_000,
     /** How often peers are told about other peers (BEP 11). The extension asks for at most once a minute. */
     val pexIntervalMillis: Long = 60_000,
-)
+    /** Optional aggregate download rate limit in bytes per second (`0` = unlimited). */
+    val maxDownloadBytesPerSec: Long = 0,
+    /** Optional aggregate upload rate limit in bytes per second (`0` = unlimited). */
+    val maxUploadBytesPerSec: Long = 0,
+) {
+    init {
+        require(maxDownloadBytesPerSec >= 0) { "maxDownloadBytesPerSec must be non-negative" }
+        require(maxUploadBytesPerSec >= 0) { "maxUploadBytesPerSec must be non-negative" }
+    }
+}
 
 /** Sliding window of outstanding requests per peer. One at a time would cap speed by latency. */
 private const val MAX_IN_FLIGHT = 16
@@ -89,8 +98,12 @@ class RhizomeClient(val config: ClientConfig = ClientConfig(), val dht: DhtNode?
     internal val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val server = ServerSocket(config.port)
     private val sessions = ConcurrentHashMap<String, TorrentSession>()
-    val peerId: ByteArray = "-RZ0200-".toByteArray() + ByteArray(12).also { SecureRandom().nextBytes(it) }
+    val peerId: ByteArray = "-RZ0300-".toByteArray() + ByteArray(12).also { SecureRandom().nextBytes(it) }
     val port: Int get() = server.localPort
+    internal val downloadLimiter: RateLimiter? =
+        config.maxDownloadBytesPerSec.takeIf { it > 0L }?.let { RateLimiter(it) }
+    internal val uploadLimiter: RateLimiter? =
+        config.maxUploadBytesPerSec.takeIf { it > 0L }?.let { RateLimiter(it) }
 
     init {
         scope.launch { acceptLoop() }
@@ -533,6 +546,7 @@ class TorrentSession internal constructor(
         }
         try {
             val block = currentStore.read(request.piece, request.begin, request.length) ?: return
+            client.uploadLimiter?.acquire(block.size)
             val encoded = PeerMessage.encode(PeerMessage.Piece(request.piece, request.begin, block))
             // Suspends when the peer reads slowly, which slows down what it gets to ask for.
             peer.outgoing.send(encoded)
@@ -543,12 +557,14 @@ class TorrentSession internal constructor(
     }
 
     private suspend fun receiveBlock(peer: PeerConnection, message: PeerMessage.Piece) {
+        var accepted = false
         lock.withLock {
             val currentPicker = picker ?: return
             val block = PiecePicker.Block(message.piece, message.begin, message.block.size)
             // Only what was actually asked for is accepted. This also drops late arrivals after
             // a cancel, and blocks of the wrong size or position.
             if (!peer.inFlight.remove(block)) return
+            accepted = true
             downloadedBytes.addAndGet(message.block.size.toLong())
 
             // Once a block has arrived, any peer racing for it in endgame can stop.
@@ -581,6 +597,7 @@ class TorrentSession internal constructor(
             }
             for (other in peers) fill(other)
         }
+        if (accepted) client.downloadLimiter?.acquire(message.block.size)
     }
 
     /** Must be called with the lock held. */

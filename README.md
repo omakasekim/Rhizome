@@ -1,5 +1,7 @@
 # Rhizome
 
+> Also available in Korean: [README.ko.md](README.ko.md)
+
 A BitTorrent client and Kademlia DHT node in Kotlin, built on structured concurrency: one coroutine
 per peer, with a bounded channel between it and the swarm.
 
@@ -8,7 +10,9 @@ and DHT node it talks to. So this one is written on the assumption that all of t
 
 ```text
 rhizome info ubuntu.torrent
-rhizome download ubuntu.torrent --out ~/Downloads
+rhizome magnet ubuntu.torrent
+rhizome scrape ubuntu.torrent --json
+rhizome download ubuntu.torrent --out ~/Downloads --max-down 2M --max-up 512K
 rhizome download "magnet:?xt=urn:btih:..." --out ~/Downloads --exit-when-done
 rhizome lookup c12fe1c06bba254a9dc9f519b335aa7c1367a88a
 rhizome create seed/photos --out photos.torrent
@@ -21,7 +25,8 @@ rhizome verify photos.torrent --dir seed --json
 | --- | --- |
 | Torrent files, peer wire protocol, HTTP trackers | BEP 3 |
 | Compact peer lists | BEP 23 |
-| UDP trackers | BEP 15 |
+| UDP trackers (announce and scrape) | BEP 15 |
+| HTTP/HTTPS tracker scrape | BEP 48 |
 | DHT node: `ping`, `find_node`, `get_peers`, `announce_peer` | BEP 5 |
 | Extension protocol and metadata exchange, which make magnet links work | BEP 10, BEP 9 |
 | Peer exchange | BEP 11 |

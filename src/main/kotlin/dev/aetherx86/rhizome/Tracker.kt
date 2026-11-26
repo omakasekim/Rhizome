@@ -32,6 +32,9 @@ class TrackerRequest(
 
 class TrackerResponse(val intervalSeconds: Int, val peers: List<InetSocketAddress>)
 
+/** Swarm counts reported by a tracker scrape (BEP 48 / BEP 15). */
+data class TrackerScrape(val complete: Int, val downloaded: Int, val incomplete: Int)
+
 /**
  * Decides whether an address taken from an untrusted file is safe to contact.
  *
@@ -67,7 +70,9 @@ object TrackerClient {
     private const val UDP_PROTOCOL_ID = 0x41727101980L
     private const val UDP_CONNECT = 0
     private const val UDP_ANNOUNCE = 1
+    private const val UDP_SCRAPE = 2
     private const val UDP_ERROR = 3
+    private const val MAX_SCRAPE_HASHES = 64
     private val random = SecureRandom()
 
     // Redirects stay off, since one could point a checked public URL at a private address.
@@ -268,6 +273,149 @@ object TrackerClient {
             val compact = ByteArray(reply.remaining())
             reply.get(compact)
             return TrackerResponse(interval, parseCompactPeers(compact))
+        }
+    }
+
+    /**
+     * Derives the BEP 48 HTTP scrape URL from an announce URL by replacing a trailing `/announce`
+     * path segment prefix with `/scrape`. Returns `null` when the tracker URL does not follow the
+     * BEP 48 announce convention.
+     */
+    fun scrapeUrl(announceUrl: String): URI? {
+        val uri = try {
+            URI(announceUrl)
+        } catch (_: java.net.URISyntaxException) {
+            return null
+        }
+        val path = uri.rawPath ?: return null
+        val slash = path.lastIndexOf('/')
+        if (slash < 0) return null
+        val tail = path.substring(slash + 1)
+        if (!tail.startsWith("announce")) return null
+        val replacedPath = path.substring(0, slash + 1) + "scrape" + tail.removePrefix("announce")
+        return URI(uri.scheme, uri.rawAuthority, replacedPath, uri.rawQuery, uri.rawFragment)
+    }
+
+    /**
+     * Queries a tracker for swarm statistics (seeders, completed downloads, leechers) via BEP 48
+     * (HTTP/HTTPS) or BEP 15 (UDP). Keys in the returned map are lowercase 40-char hex info hashes.
+     */
+    suspend fun scrape(
+        url: String,
+        infoHashes: List<ByteArray>,
+        allowPrivate: Boolean,
+    ): Map<String, TrackerScrape> = withContext(Dispatchers.IO) {
+        if (infoHashes.isEmpty() || infoHashes.size > MAX_SCRAPE_HASHES) {
+            throw TrackerError("scrape expects between 1 and $MAX_SCRAPE_HASHES info hashes")
+        }
+        for (hash in infoHashes) {
+            if (hash.size != 20) throw TrackerError("scrape info hash must be 20 bytes")
+        }
+        val uri = try {
+            URI(url)
+        } catch (_: java.net.URISyntaxException) {
+            throw TrackerError("invalid tracker URL: $url")
+        }
+        val scheme = uri.scheme?.lowercase()
+        if (scheme != "http" && scheme != "https" && scheme != "udp") {
+            throw TrackerError("unsupported tracker scheme: $scheme")
+        }
+        val host = uri.host ?: throw TrackerError("a tracker URL has no host: $url")
+        val addresses = try {
+            InetAddress.getAllByName(host)
+        } catch (_: java.net.UnknownHostException) {
+            throw TrackerError("cannot resolve tracker host $host")
+        }
+        if (!allowPrivate && addresses.any { !AddressPolicy.isPublic(it) }) {
+            throw TrackerError("refusing to contact a tracker on a private address: $host")
+        }
+        if (scheme == "udp") {
+            val port = uri.port.takeIf { it in 1..65535 } ?: throw TrackerError("a UDP tracker needs a port")
+            scrapeUdp(InetSocketAddress(addresses[0], port), infoHashes)
+        } else {
+            val scrapeUri = scrapeUrl(url)
+                ?: throw TrackerError("tracker does not support BEP 48 scrape: $url")
+            scrapeHttp(scrapeUri, infoHashes)
+        }
+    }
+
+    private fun scrapeHttp(scrapeUri: URI, infoHashes: List<ByteArray>): Map<String, TrackerScrape> {
+        val query = infoHashes.joinToString("&") { "info_hash=${encodeBytes(it)}" }
+        val separator = if (scrapeUri.rawQuery == null) "?" else "&"
+        val target = URI.create(scrapeUri.toString() + separator + query)
+        val response = try {
+            http.send(
+                HttpRequest.newBuilder(target).timeout(Duration.ofSeconds(15)).GET().build(),
+                HttpResponse.BodyHandlers.ofInputStream(),
+            )
+        } catch (e: IOException) {
+            throw TrackerError("the scrape request failed: ${e.message}")
+        }
+        if (response.statusCode() != 200) {
+            response.body().close()
+            throw TrackerError("the tracker answered scrape with status ${response.statusCode()}")
+        }
+        val body = response.body().use { it.readNBytes(MAX_RESPONSE_BYTES + 1) }
+        if (body.size > MAX_RESPONSE_BYTES) throw TrackerError("the scrape response is too large")
+        return parseHttpScrapeResponse(body)
+    }
+
+    internal fun parseHttpScrapeResponse(body: ByteArray): Map<String, TrackerScrape> {
+        val dict = try {
+            Bencode.decode(body) as? BDict
+        } catch (e: BencodeError) {
+            throw TrackerError("the tracker sent a malformed scrape response: ${e.message}")
+        } ?: throw TrackerError("the scrape response is not a dictionary")
+        dict.text("failure reason")?.let { throw TrackerError("the tracker refused scrape: $it") }
+        val files = dict.dict("files") ?: throw TrackerError("the scrape response has no files dictionary")
+        val out = LinkedHashMap<String, TrackerScrape>()
+        for ((key, value) in files.entries) {
+            val rawHash = key.toByteArray(Charsets.ISO_8859_1)
+            if (rawHash.size != 20) continue
+            val stats = value as? BDict ?: continue
+            val complete = stats.int("complete")?.coerceIn(0, Int.MAX_VALUE.toLong())?.toInt() ?: 0
+            val downloaded = stats.int("downloaded")?.coerceIn(0, Int.MAX_VALUE.toLong())?.toInt() ?: 0
+            val incomplete = stats.int("incomplete")?.coerceIn(0, Int.MAX_VALUE.toLong())?.toInt() ?: 0
+            out[rawHash.toHex()] = TrackerScrape(complete, downloaded, incomplete)
+        }
+        return out
+    }
+
+    private fun scrapeUdp(target: InetSocketAddress, infoHashes: List<ByteArray>): Map<String, TrackerScrape> {
+        DatagramSocket().use { socket ->
+            val connectTransaction = random.nextInt()
+            val connect = ByteBuffer.allocate(16)
+                .putLong(UDP_PROTOCOL_ID)
+                .putInt(UDP_CONNECT)
+                .putInt(connectTransaction)
+                .array()
+            val connected = exchange(socket, target, connect, connectTransaction)
+            if (connected.remaining() < 16 || connected.getInt() != UDP_CONNECT) {
+                throw TrackerError("the UDP tracker sent a malformed connect reply")
+            }
+            connected.getInt()
+            val connectionId = connected.getLong()
+
+            val transaction = random.nextInt()
+            val request = ByteBuffer.allocate(16 + infoHashes.size * 20)
+                .putLong(connectionId)
+                .putInt(UDP_SCRAPE)
+                .putInt(transaction)
+            for (hash in infoHashes) request.put(hash)
+
+            val reply = exchange(socket, target, request.array(), transaction)
+            if (reply.remaining() < 8 + infoHashes.size * 12 || reply.getInt() != UDP_SCRAPE) {
+                throw TrackerError("the UDP tracker sent a malformed scrape reply")
+            }
+            reply.getInt()
+            val out = LinkedHashMap<String, TrackerScrape>(infoHashes.size)
+            for (hash in infoHashes) {
+                val seeders = reply.getInt().coerceAtLeast(0)
+                val completed = reply.getInt().coerceAtLeast(0)
+                val leechers = reply.getInt().coerceAtLeast(0)
+                out[hash.toHex()] = TrackerScrape(seeders, completed, leechers)
+            }
+            return out
         }
     }
 }

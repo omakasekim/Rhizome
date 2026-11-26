@@ -167,7 +167,7 @@ class CliTest {
     fun versionIsReported() {
         assertEquals("rhizome $RHIZOME_VERSION", run("version").out.trim())
         assertEquals(mapOf("version" to RHIZOME_VERSION), run("--version", "--json").json())
-        assertTrue(RhizomeClient().use { String(it.peerId, 0, 8) } == "-RZ0200-")
+        assertTrue(RhizomeClient().use { String(it.peerId, 0, 8) } == "-RZ0300-")
     }
 
     @Test
